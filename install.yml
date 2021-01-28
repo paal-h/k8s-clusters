@@ -1,0 +1,141 @@
+- hosts: "{{ cluster }}"
+  become: yes
+  vars:
+    calico_manifest_url: https://docs.projectcalico.org/manifests/calico.yaml
+    packages:
+      - docker.io
+      - kubelet
+      - kubeadm
+      - kubectl
+      - jq
+ 
+  tasks:
+  - name: add Google's apt repository gpg key
+    shell: apt-key adv --fetch-keys https://packages.cloud.google.com/apt/doc/apt-key.gpg
+    changed_when: false
+
+  - name: add the Kubernetes apt repository
+    copy:
+      dest: /etc/apt/sources.list.d/kubernetes.list
+      content: |
+        deb https://apt.kubernetes.io/ kubernetes-xenial main
+    
+  - name: Install packages
+    apt: name={{ packages }} state=latest update_cache=true
+
+  - name: Freeze packages versions
+    shell: apt-mark hold docker.io kubelet kubeadm kubectl
+    changed_when: false
+
+  - name: Setup docker daemon
+    copy:
+      dest: /etc/docker/daemon.json
+      content: |
+        {
+          "exec-opts": ["native.cgroupdriver=systemd"],
+          "log-driver": "json-file",
+          "log-opts": {
+          "max-size": "100m"
+          },
+          "storage-driver": "overlay2"
+        }
+    register: docker
+
+  - service: name={{ item }} state=restarted enabled=yes
+    with_items:
+      - kubelet
+      - docker
+    when: docker.changed
+
+  - name: Create fact dir
+    file: path=/etc/ansible/facts.d state=directory
+
+### Install master node
+  - name: Install and configure kubeadm
+    block:
+
+    - name: Initialize master node
+      shell: kubeadm init --pod-network-cidr=192.168.0.0/16
+  
+    - name: Get calico manifest
+      get_url: 
+        url: "{{ calico_manifest_url }}"
+        dest: "/etc/kubernetes/manifests/"
+
+    - name: Apply calico 
+      shell: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf;
+        kubectl apply -f /etc/kubernetes/manifests/{{ calico_manifest_url|basename }}
+
+    - name: Set local fact
+      copy:
+        dest: /etc/ansible/facts.d/kubernetes.fact
+        content: |
+          [kubeadm]
+          configured=true
+
+    ### Copy credentials
+    - name: Create cred directory
+      file:
+        path: "/home/{{ lookup('env','USER') }}/.kube"
+        state: directory
+        mode: 0700
+      delegate_to: localhost
+      become: no
+      when: 
+        - role == "master"
+  
+    - name: Copy cred config
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ lookup('env','USER') }}/.kube/{{ cluster }}.yml"
+        mode: 0600
+        flat: yes
+        fail_on_missing: yes
+      when: 
+        - role == "master"
+
+    when: 
+      - role == "master"
+      - ansible_local.kubernetes.kubeadm.configured|default(false)|bool != true
+
+### Get some data from master
+  - name: Get data
+    block:
+
+    - name: Get token
+      shell: kubeadm token list -o json | jq -r .token
+      register: token
+      changed_when: false
+  
+    - name: Get cacert hash
+      shell: |
+        openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | \
+        openssl rsa -pubin -outform der 2>/dev/null | \
+        openssl dgst -sha256 -hex | sed 's/^.* //'    
+      register: ca_hash
+      changed_when: false
+
+    when: 
+      - role == "master"
+
+### Add worker node
+  - name: Add worker
+    block:
+
+    - name: Initialize worker node
+      shell: |
+        kubeadm join {{ hostvars[master].ansible_default_ipv4.address }}:6443 \
+        --token {{ hostvars[master].token.stdout }} \
+        --discovery-token-ca-cert-hash sha256:{{ hostvars[master].ca_hash.stdout }}
+
+    - name: Set local fact
+      copy:
+        dest: /etc/ansible/facts.d/kubernetes.fact
+        content: |
+          [kubeadm]
+          configured=true
+
+    when:
+      - role == "worker"
+      - ansible_local.kubernetes.kubeadm.configured|default(false)|bool != true

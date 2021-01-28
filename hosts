@@ -1,0 +1,6 @@
+[c1]
+c1-0 ansible_host=10.1.1.20 role=master
+c1-1 ansible_host=10.1.1.21 role=worker
+
+[c1:vars]
+master=c1-0
